@@ -7,6 +7,7 @@ import { conversations, type ConversationFlavor } from '@grammyjs/conversations'
 import { Effect } from 'effect';
 import type { Env } from '../../../shared/types';
 import { AppLayer, type AppServices, DatabaseService, FeeFetcherService } from '../../../application';
+import { DatabaseError, FeeFetcherError } from '../../../shared/errors';
 import { DEFAULT_THRESHOLDS } from '../../../domain/fee';
 import type { SessionData } from '../types';
 import { formatBalanceMessage, formatSettingsMessage } from '../messages';
@@ -22,12 +23,21 @@ export function createBalanceCommand(env: Env) {
     const userId = ctx.from?.id.toString();
     if (!userId) return;
 
-    const result = await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        return yield* _(db.getUser(userId));
-      })
-    );
+    let result;
+    try {
+      result = await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          return yield* _(db.getUser(userId));
+        })
+      );
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 获取用户数据失败：${error.message}`
+        : `❌ 获取用户数据失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage);
+      return;
+    }
 
     if (!result?.feeUrl) {
       await ctx.reply('⚠️ 尚未设置查询链接。\n请先使用 /start 配置。');
@@ -50,43 +60,66 @@ export function createUpdateCommand(env: Env) {
     const userId = ctx.from?.id.toString();
     if (!userId) return;
 
-    const result = await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        return yield* _(db.getUser(userId));
-      })
-    );
+    let user;
+    try {
+      user = await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          return yield* _(db.getUser(userId));
+        })
+      );
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 获取用户数据失败：${error.message}`
+        : `❌ 获取用户数据失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage);
+      return;
+    }
 
-    if (!result?.feeUrl) {
+    if (!user?.feeUrl) {
       await ctx.reply('⚠️ 尚未设置查询链接。\n请先使用 /start 配置。');
       return;
     }
 
     const msg = await ctx.reply('⏳ 正在刷新余额…');
 
-    const balances = await runEffect(env,
-      Effect.gen(function* (_) {
-        const feeFetcher = yield* _(FeeFetcherService);
-        return yield* _(feeFetcher.fetchBalances(result.feeUrl!));
-      })
-    );
+    let balances;
+    try {
+      balances = await runEffect(env,
+        Effect.gen(function* (_) {
+          const feeFetcher = yield* _(FeeFetcherService);
+          return yield* _(feeFetcher.fetchBalances(user.feeUrl!));
+        })
+      );
+    } catch (error) {
+      const errorMessage = error instanceof FeeFetcherError
+        ? `❌ 刷新余额失败：${error.message}`
+        : `❌ 刷新余额失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.api.editMessageText(ctx.chat!.id, msg.message_id, errorMessage);
+      return;
+    }
 
     if (!balances || Object.keys(balances).length === 0) {
       await ctx.api.editMessageText(ctx.chat!.id, msg.message_id, '❌ 未能获取余额数据，请检查链接是否过期。');
       return;
     }
 
-    await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        yield* _(db.updateUserCache(userId, balances));
-      })
-    );
+    try {
+      await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          yield* _(db.updateUserCache(userId, balances));
+        })
+      );
+    } catch (error) {
+      // 缓存更新失败不影响显示余额，只记录日志
+      console.error('Failed to update cache:', error);
+    }
 
     await ctx.api.editMessageText(
       ctx.chat!.id, 
       msg.message_id, 
-      formatBalanceMessage(balances, result.thresholds ?? DEFAULT_THRESHOLDS), 
+      formatBalanceMessage(balances, user.thresholds ?? DEFAULT_THRESHOLDS), 
       { parse_mode: 'Markdown' }
     );
   };
@@ -97,14 +130,21 @@ export function createSettingsCommand(env: Env) {
     const userId = ctx.from?.id.toString();
     if (!userId) return;
 
-    const user = await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        return yield* _(db.getOrCreateUser(userId));
-      })
-    );
+    try {
+      const user = await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          return yield* _(db.getOrCreateUser(userId));
+        })
+      );
 
-    await ctx.reply(formatSettingsMessage(user), { parse_mode: 'Markdown', reply_markup: createSettingsKeyboard() });
+      await ctx.reply(formatSettingsMessage(user), { parse_mode: 'Markdown', reply_markup: createSettingsKeyboard() });
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 获取设置失败：${error.message}`
+        : `❌ 获取设置失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage);
+    }
   };
 }
 
@@ -113,12 +153,21 @@ export function createLinkCommand(env: Env) {
     const userId = ctx.from?.id.toString();
     if (!userId) return;
 
-    const user = await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        return yield* _(db.getUser(userId));
-      })
-    );
+    let user;
+    try {
+      user = await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          return yield* _(db.getUser(userId));
+        })
+      );
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 获取用户数据失败：${error.message}`
+        : `❌ 获取用户数据失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage);
+      return;
+    }
 
     if (user?.feeUrl) {
       await ctx.reply(`🔗 *你的查询链接：*\n\n\`${user.feeUrl}\``, { parse_mode: 'Markdown' });
@@ -155,14 +204,21 @@ export function createResetConfirmCallback(env: Env) {
     const userId = ctx.from?.id.toString();
     if (!userId) return;
 
-    await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        yield* _(db.deleteUser(userId));
-      })
-    );
+    try {
+      await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          yield* _(db.deleteUser(userId));
+        })
+      );
 
-    await ctx.editMessageText('✅ 所有个人数据已清除。');
+      await ctx.editMessageText('✅ 所有个人数据已清除。');
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 清除数据失败：${error.message}`
+        : `❌ 清除数据失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.editMessageText(errorMessage);
+    }
   };
 }
 
@@ -171,14 +227,21 @@ export function createSettingsBackCallback(env: Env) {
     const userId = ctx.from?.id.toString();
     if (!userId) return;
 
-    const user = await runEffect(env,
-      Effect.gen(function* (_) {
-        const db = yield* _(DatabaseService);
-        return yield* _(db.getOrCreateUser(userId));
-      })
-    );
+    try {
+      const user = await runEffect(env,
+        Effect.gen(function* (_) {
+          const db = yield* _(DatabaseService);
+          return yield* _(db.getOrCreateUser(userId));
+        })
+      );
 
-    await ctx.editMessageText(formatSettingsMessage(user), { parse_mode: 'Markdown', reply_markup: createSettingsKeyboard() });
+      await ctx.editMessageText(formatSettingsMessage(user), { parse_mode: 'Markdown', reply_markup: createSettingsKeyboard() });
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 获取设置失败：${error.message}`
+        : `❌ 获取设置失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.editMessageText(errorMessage);
+    }
   };
 }
 

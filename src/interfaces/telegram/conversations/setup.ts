@@ -10,6 +10,7 @@ import type { Env } from '../../../shared/types';
 import type { FeeType, Balances, ThresholdConfig } from '../../../domain/fee';
 import { FEE_TYPE_INFO, DEFAULT_THRESHOLDS, THRESHOLD_STEPS, DEFAULT_CHECK_INTERVAL, MIN_CHECK_INTERVAL } from '../../../domain/fee';
 import { AppLayer, type AppServices, DatabaseService, FeeFetcherService, SsoService } from '../../../application';
+import { SsoError, FeeFetcherError, DatabaseError } from '../../../shared/errors';
 import type { SessionData } from '../types';
 import { formatHelpMessage, formatBalanceMessage, formatSetupWelcome } from '../messages';
 import { createSetupUrlKeyboard, createSkipKeyboard, createSkipIntervalKeyboard } from '../keyboards';
@@ -70,10 +71,19 @@ export function createSetupConversation(env: Env) {
 
         const loadingMsg = await ctx.reply('⏳ 正在通过 SSO 登录并获取链接，请稍候…\n（此过程可能需要 30-60 秒）');
 
-        feeUrl = await conversation.external(() =>
-          Effect.runPromise(sso.fetchFeeUrl(username, password).pipe(Effect.provide(AppLayer(env))))
-        );
-        await ctx.api.editMessageText(ctx.chat!.id, loadingMsg.message_id, '✅ 链接已获取，正在验证有效性…');
+        try {
+          feeUrl = await conversation.external(() =>
+            Effect.runPromise(sso.fetchFeeUrl(username, password).pipe(Effect.provide(AppLayer(env))))
+          );
+          await ctx.api.editMessageText(ctx.chat!.id, loadingMsg.message_id, '✅ 链接已获取，正在验证有效性…');
+        } catch (error) {
+          await ctx.api.deleteMessage(ctx.chat!.id, loadingMsg.message_id).catch(() => {});
+          const errorMessage = error instanceof SsoError
+            ? `❌ SSO 登录失败：${error.message}`
+            : `❌ SSO 登录失败：${error instanceof Error ? error.message : '未知错误'}`;
+          await ctx.reply(errorMessage + '\n\n请重新点击 SSO 登录按钮重试，或选择手动粘贴链接。');
+          return;
+        }
       } else {
         return;
       }
@@ -81,9 +91,18 @@ export function createSetupConversation(env: Env) {
       feeUrl = urlResponse.message.text.trim();
     }
 
-    const balances = await conversation.external(() =>
-      Effect.runPromise(feeFetcher.fetchBalances(feeUrl).pipe(Effect.provide(AppLayer(env))))
-    );
+    let balances: Balances | null = null;
+    try {
+      balances = await conversation.external(() =>
+        Effect.runPromise(feeFetcher.fetchBalances(feeUrl).pipe(Effect.provide(AppLayer(env))))
+      );
+    } catch (error) {
+      const errorMessage = error instanceof FeeFetcherError
+        ? `❌ 链接验证失败：${error.message}`
+        : `❌ 链接验证失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage + '\n\n请重新发送正确的链接，或点击 SSO 登录重新获取。');
+      return;
+    }
 
     if (!balances || Object.keys(balances).length === 0) {
       await ctx.reply('❌ 无法获取余额数据，链接可能无效或已过期。\n\n请重新发送正确的链接：');
@@ -95,15 +114,23 @@ export function createSetupConversation(env: Env) {
       return;
     }
 
-    await conversation.external(() =>
-      Effect.runPromise(
-        Effect.gen(function* (_) {
-          const db = yield* _(DatabaseService);
-          yield* _(db.updateUserUrl(userId, feeUrl));
-          yield* _(db.updateUserCache(userId, balances));
-        }).pipe(Effect.provide(AppLayer(env)))
-      )
-    );
+    try {
+      await conversation.external(() =>
+        Effect.runPromise(
+          Effect.gen(function* (_) {
+            const db = yield* _(DatabaseService);
+            yield* _(db.updateUserUrl(userId, feeUrl));
+            yield* _(db.updateUserCache(userId, balances!));
+          }).pipe(Effect.provide(AppLayer(env)))
+        )
+      );
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 保存配置失败：${error.message}`
+        : `❌ 保存配置失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage + '\n\n请稍后重试，或联系管理员。');
+      return;
+    }
 
     const balanceLines = ['✅ 链接验证成功！当前余额：\n'];
     for (const [key, info] of Object.entries(FEE_TYPE_INFO)) {
@@ -135,16 +162,24 @@ export function createSetupConversation(env: Env) {
       }
     }
 
-    await conversation.external(() =>
-      Effect.runPromise(
-        Effect.gen(function* (_) {
-          const db = yield* _(DatabaseService);
-          for (const [key, value] of Object.entries(currentThresholds)) {
-            yield* _(db.updateUserThreshold(userId, key as FeeType, value));
-          }
-        }).pipe(Effect.provide(AppLayer(env)))
-      )
-    );
+    try {
+      await conversation.external(() =>
+        Effect.runPromise(
+          Effect.gen(function* (_) {
+            const db = yield* _(DatabaseService);
+            for (const [key, value] of Object.entries(currentThresholds)) {
+              yield* _(db.updateUserThreshold(userId, key as FeeType, value));
+            }
+          }).pipe(Effect.provide(AppLayer(env)))
+        )
+      );
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 保存预警阈值失败：${error.message}`
+        : `❌ 保存预警阈值失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage + '\n\n请稍后重试，或联系管理员。');
+      return;
+    }
 
     await ctx.reply(
       `✅ ${FEE_TYPE_INFO[THRESHOLD_STEPS[THRESHOLD_STEPS.length - 1]].label} 预警阈值已设为 ${currentThresholds[THRESHOLD_STEPS[THRESHOLD_STEPS.length - 1]]}\n\n` +
@@ -162,14 +197,22 @@ export function createSetupConversation(env: Env) {
       if (!isNaN(value) && (value === 0 || value >= MIN_CHECK_INTERVAL)) interval = value;
     }
 
-    await conversation.external(() =>
-      Effect.runPromise(
-        Effect.gen(function* (_) {
-          const db = yield* _(DatabaseService);
-          yield* _(db.updateUserCheckInterval(userId, interval));
-        }).pipe(Effect.provide(AppLayer(env)))
-      )
-    );
+    try {
+      await conversation.external(() =>
+        Effect.runPromise(
+          Effect.gen(function* (_) {
+            const db = yield* _(DatabaseService);
+            yield* _(db.updateUserCheckInterval(userId, interval));
+          }).pipe(Effect.provide(AppLayer(env)))
+        )
+      );
+    } catch (error) {
+      const errorMessage = error instanceof DatabaseError
+        ? `❌ 保存刷新间隔失败：${error.message}`
+        : `❌ 保存刷新间隔失败：${error instanceof Error ? error.message : '未知错误'}`;
+      await ctx.reply(errorMessage + '\n\n请稍后重试，或联系管理员。');
+      return;
+    }
 
     await ctx.reply(
       '🎉 *配置完成！*\n\n现在可以使用以下命令：\n/balance — 查询余额\n/update — 刷新余额\n/charge — 充值\n/settings — 修改设置\n/cancel — 取消当前操作',
