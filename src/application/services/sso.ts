@@ -15,6 +15,25 @@ const CLIENT_TYPE = 'android';
 const TARGET_APP_URL = 'https://sos.zcst.edu.cn/login?service=https%3A%2F%2Fhub.17wanxiao.com%2Fbsacs%2Flight.action%3Fflag%3Dcassso_zhkjxysdZ%26ecardFunc%3Dindex';
 const USER_AGENT = 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.0.0 Mobile Safari/537.36 iPortal/30';
 
+const GLOBAL_TIMEOUT_MS = 30000;
+const OPERATION_TIMEOUT_MS = 5000;
+const ELEMENT_TIMEOUT_MS = 3000;
+
+const withTimeout = <A>(
+  promise: Promise<A>,
+  ms: number = OPERATION_TIMEOUT_MS,
+  errorMsg: string = 'Operation timed out'
+): Effect.Effect<A, SsoError> =>
+  Effect.raceFirst(
+    Effect.tryPromise({
+      try: () => promise,
+      catch: (e) => SsoError.loginFailed(`${errorMsg}: ${e instanceof Error ? e.message : String(e)}`),
+    }),
+    Effect.sleep(`${ms} millis`).pipe(
+      Effect.flatMap(() => Effect.fail(SsoError.loginFailed(errorMsg)))
+    )
+  );
+
 interface SsoConfig {
   deviceKey: string;
   miSsl: string;
@@ -93,17 +112,17 @@ type Element = {
 const findVisibleElement = (
   page: PageElement, 
   selectors: string[]
-): Effect.Effect<unknown | null, never> =>
+): Effect.Effect<unknown | null, SsoError> =>
   Effect.gen(function* (_) {
     for (const selector of selectors) {
       const element = yield* _(
-        Effect.promise(() => page.$(selector)).pipe(
+        withTimeout(page.$(selector), ELEMENT_TIMEOUT_MS, `Failed to find ${selector}`).pipe(
           Effect.catchAll(() => Effect.succeed(null))
         )
       );
       if (element) {
         const isVisible = yield* _(
-          Effect.promise(() => (element as Element).isIntersectingViewport()).pipe(
+          withTimeout((element as Element).isIntersectingViewport(), ELEMENT_TIMEOUT_MS).pipe(
             Effect.catchAll(() => Effect.succeed(false))
           )
         );
@@ -118,8 +137,8 @@ const waitForElement = (
   selectors: string[],
   options?: { timeout?: DurationInput; interval?: DurationInput }
 ): Effect.Effect<unknown, SsoError> => {
-  const timeout = options?.timeout ?? '30 seconds';
-  const interval = options?.interval ?? '500 millis';
+  const timeout = options?.timeout ?? '10 seconds';
+  const interval = options?.interval ?? '300 millis';
   
   const schedule = Schedule.fixed(interval).pipe(
     Schedule.upTo(timeout)
@@ -136,31 +155,39 @@ const waitForElement = (
 
 const checkLoginStatus = (
   page: PageElement
-): Effect.Effect<{ success: boolean; error?: string }, never> =>
+): Effect.Effect<{ success: boolean; error?: string }, SsoError> =>
   Effect.gen(function* (_) {
-    const currentUrl = page.url();
-    const host = new URL(currentUrl).hostname;
+    const currentUrl = yield* _(
+      withTimeout(Promise.resolve(page.url()), ELEMENT_TIMEOUT_MS, 'Failed to get URL').pipe(
+        Effect.catchAll(() => Effect.succeed(''))
+      )
+    );
     
-    if (!SSO_HOSTS.has(host)) {
-      return { success: true };
+    try {
+      const host = new URL(currentUrl).hostname;
+      if (!SSO_HOSTS.has(host)) {
+        return { success: true };
+      }
+    } catch {
+      return { success: false };
     }
 
     const errorSelectors = ['.error-msg', '.login-error', '.alert-danger'];
     for (const selector of errorSelectors) {
       const errorEl = yield* _(
-        Effect.promise(() => page.$(selector)).pipe(
+        withTimeout(page.$(selector), ELEMENT_TIMEOUT_MS).pipe(
           Effect.catchAll(() => Effect.succeed(null))
         )
       );
       if (errorEl) {
         const isVisible = yield* _(
-          Effect.promise(() => (errorEl as Element).isIntersectingViewport()).pipe(
+          withTimeout((errorEl as Element).isIntersectingViewport(), ELEMENT_TIMEOUT_MS).pipe(
             Effect.catchAll(() => Effect.succeed(false))
           )
         );
         if (isVisible) {
           const errorText = yield* _(
-            Effect.promise(() => (errorEl as Element).evaluate((el) => (el as { textContent?: string }).textContent || '')).pipe(
+            withTimeout((errorEl as Element).evaluate((el) => (el as { textContent?: string }).textContent || ''), ELEMENT_TIMEOUT_MS).pipe(
               Effect.catchAll(() => Effect.succeed(''))
             )
           );
@@ -176,9 +203,9 @@ const checkLoginStatus = (
 
 const waitForLoginComplete = (
   page: PageElement,
-  timeout: DurationInput = '60 seconds'
+  timeout: DurationInput = '15 seconds'
 ): Effect.Effect<void, SsoError> => {
-  const schedule = Schedule.fixed('1 second').pipe(
+  const schedule = Schedule.fixed('500 millis').pipe(
     Schedule.upTo(timeout)
   );
 
@@ -198,25 +225,25 @@ const waitForLoginComplete = (
 const waitForTargetUrl = (
   page: PageElement,
   patterns: string[],
-  timeout: DurationInput = '40 seconds'
+  timeout: DurationInput = '10 seconds'
 ): Effect.Effect<string, SsoError> => {
-  const schedule = Schedule.fixed('1 second').pipe(
+  const schedule = Schedule.fixed('500 millis').pipe(
     Schedule.upTo(timeout)
   );
 
-  return Effect.sync(() => {
-    const currentUrl = page.url();
+  return Effect.gen(function* (_) {
+    const currentUrl = yield* _(
+      withTimeout(Promise.resolve(page.url()), ELEMENT_TIMEOUT_MS, 'Failed to get URL').pipe(
+        Effect.catchAll(() => Effect.succeed(''))
+      )
+    );
     for (const pattern of patterns) {
       if (currentUrl.includes(pattern)) {
         return currentUrl;
       }
     }
-    return null;
+    return yield* _(Effect.fail(SsoError.urlNotFound()));
   }).pipe(
-    Effect.filterOrFail(
-      (url): url is string => url !== null,
-      () => SsoError.urlNotFound()
-    ),
     Effect.retry(schedule)
   );
 };
@@ -267,29 +294,29 @@ export const SsoServiceLive = Layer.effect(
               ];
 
               const passwordField = yield* _(
-                waitForElement(page, passwordSelectors, { timeout: '30 seconds', interval: '500 millis' })
+                waitForElement(page, passwordSelectors, { timeout: '10 seconds', interval: '300 millis' })
               );
 
               const tabSelectors = ['[class*="tab-item"]', '[class*="login-tab"]', '[class*="way-item"]', '[class*="login-way"]'];
               for (const selector of tabSelectors) {
                 const tabs = yield* _(
-                  Effect.promise(() => page.$$(selector)).pipe(
+                  withTimeout(page.$$(selector), OPERATION_TIMEOUT_MS).pipe(
                     Effect.catchAll(() => Effect.succeed([]))
                   )
                 );
                 for (const tab of tabs) {
                   const text = yield* _(
-                    Effect.promise(() => (tab as Element).evaluate((el) => (el as { textContent?: string }).textContent || '')).pipe(
+                    withTimeout((tab as Element).evaluate((el) => (el as { textContent?: string }).textContent || ''), OPERATION_TIMEOUT_MS).pipe(
                       Effect.catchAll(() => Effect.succeed(''))
                     )
                   );
                   if (['用户名', '密码', '账号'].some((kw) => text.includes(kw))) {
                     yield* _(
-                      Effect.promise(() => (tab as Element).click()).pipe(
+                      withTimeout((tab as Element).click(), OPERATION_TIMEOUT_MS).pipe(
                         Effect.catchAll(() => Effect.void)
                       )
                     );
-                    yield* _(Effect.sleep('500 millis'));
+                    yield* _(Effect.sleep('300 millis'));
                     break;
                   }
                 }
@@ -313,12 +340,12 @@ export const SsoServiceLive = Layer.effect(
               }
 
               yield* _(
-                Effect.promise(() => (usernameField as Element).type(username, { delay: 50 })).pipe(
+                withTimeout((usernameField as Element).type(username, { delay: 30 }), OPERATION_TIMEOUT_MS).pipe(
                   Effect.catchAll(() => Effect.void)
                 )
               );
               yield* _(
-                Effect.promise(() => (passwordField as Element).type(password, { delay: 50 })).pipe(
+                withTimeout((passwordField as Element).type(password, { delay: 30 }), OPERATION_TIMEOUT_MS).pipe(
                   Effect.catchAll(() => Effect.void)
                 )
               );
@@ -336,18 +363,18 @@ export const SsoServiceLive = Layer.effect(
 
               if (!submitBtn) {
                 const buttons = yield* _(
-                  Effect.promise(() => page.$$('button')).pipe(
+                  withTimeout(page.$$('button'), OPERATION_TIMEOUT_MS).pipe(
                     Effect.catchAll(() => Effect.succeed([]))
                   )
                 );
                 for (const btn of buttons) {
                   const text = yield* _(
-                    Effect.promise(() => (btn as Element).evaluate((el) => (el as { textContent?: string }).textContent || '')).pipe(
+                    withTimeout((btn as Element).evaluate((el) => (el as { textContent?: string }).textContent || ''), OPERATION_TIMEOUT_MS).pipe(
                       Effect.catchAll(() => Effect.succeed(''))
                     )
                   );
                   const isVisible = yield* _(
-                    Effect.promise(() => (btn as Element).isIntersectingViewport()).pipe(
+                    withTimeout((btn as Element).isIntersectingViewport(), ELEMENT_TIMEOUT_MS).pipe(
                       Effect.catchAll(() => Effect.succeed(false))
                     )
                   );
@@ -363,7 +390,7 @@ export const SsoServiceLive = Layer.effect(
               }
 
               yield* _(
-                Effect.promise(() => (submitBtn as Element).click()).pipe(
+                withTimeout((submitBtn as Element).click(), OPERATION_TIMEOUT_MS).pipe(
                   Effect.catchAll(() => Effect.void)
                 )
               );
@@ -377,7 +404,7 @@ export const SsoServiceLive = Layer.effect(
               );
 
               const feeUrl = yield* _(
-                waitForTargetUrl(page, ['params=', 'xqh5.17wanxiao.com'], '40 seconds')
+                waitForTargetUrl(page, ['params=', 'xqh5.17wanxiao.com'], '10 seconds')
               );
 
               return feeUrl;
@@ -386,7 +413,9 @@ export const SsoServiceLive = Layer.effect(
                 browser.closeSession(session).pipe(
                   Effect.catchAll(() => Effect.void)
                 )
-              )
+              ),
+              Effect.timeout(`${GLOBAL_TIMEOUT_MS} millis`),
+              Effect.mapError(() => SsoError.loginFailed('Global timeout'))
             )
           );
 
