@@ -8,6 +8,7 @@
   "main": "src/main.ts",
   "compatibility_date": "2025-09-27",
   "compatibility_flags": ["nodejs_compat"],
+  "account_id": "14f4e174b7d69a5607727b6fb69ae526",
 
   "observability": {
     "enabled": true,
@@ -22,7 +23,7 @@
     {
       "binding": "DB",
       "database_name": "zcst-bot-db",
-      "database_id": "placeholder-will-be-replaced",
+      "database_id": "22a8c2de-f92b-433f-87fd-b302ddb7978b",
       "migrations_dir": "./drizzle"
     }
   ],
@@ -42,7 +43,7 @@
   "kv_namespaces": [
     {
       "binding": "KV",
-      "id": "placeholder-will-be-replaced"
+      "id": "d260373cbe524c7cac5749dc180a6806"
     }
   ],
 
